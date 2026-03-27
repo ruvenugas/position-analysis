@@ -1,0 +1,528 @@
+from math import hypot, cos, pi, acos
+import networkx as nx
+import heapq
+from scipy.spatial import Delaunay
+
+"""Helper functions"""
+
+def tweak_duplicates(frame, offset = float(0.000001)):
+    """Rounds coordinates and iteratively adds an offset term to the x-coordinate of duplicate
+    coordinates
+    
+    Note: Minimum possible offset is e-6 due to Delaunay triangulation crashing (empirically tested)
+    """
+
+    # Create set of unique coordinates
+    unique_coords = set(frame.values())
+
+    # Assert offset >= e-6
+    if offset < float(0.000001):
+        print('Offset must not be smaller than e-6. Offset set to e-6')
+        offset = float(0.000001)
+
+    # Iteratively add offset to double coordinates
+    while len(unique_coords) != len(frame):
+        appendix = set()
+        for coord in unique_coords:
+            m = 0
+            for point in frame:
+                if frame[point] == coord:
+                    frame[point] = (coord[0] + m*offset, coord[1])
+                    if frame[point] not in unique_coords:
+                        appendix.add(frame[point])
+
+                    m += 1
+
+        unique_coords = unique_coords.union(appendix)
+
+    return frame
+
+def vector(frame, e):
+    """Creates edge vector from point p = e[0] to point q = e[1]"""
+    p,q = e
+    return (frame[q][0] - frame[p][0], frame[q][1] - frame[p][1])
+
+def cos_vec(v1,v2):
+    """Determines (smaller) cosine between two vectors v1,v2
+
+    Note: Values bigger than 1 or smaller than -1 will be rounded to avoid float errors
+    """
+    result = (v1[0]*v2[0] + v1[1]*v2[1])/(hypot(*v1)*hypot(*v2))
+    if result > 1:
+        return 1
+    if result < -1:
+        return -1
+    else:
+        return result
+
+def left_cos(v1,v2):
+    """Determines cosine to the left (counter-clockwise) from v1 to v2
+    (subtracts 2 from negative left cosine if alpha > pi to achieve a steady, decreasing function between 0 and 2*pi)
+    """
+    cross_product =  v2[1]*v1[0] - v2[0]*v1[1]
+    if cross_product <= 0:
+        return -2 - cos_vec(v1,v2)
+    else:
+        return cos_vec(v1,v2)
+
+def iter_edges(frame, p_start, p_end, v_start, S):
+    """Return edges from point p_start to p_end in counter-clockwise direction 
+    on external face of NetworkX graph, or clockwise direction on internal face.
+    
+    Note: The idea is to let v_start rotate counter clockwise with p_start as 
+    its pivot until it reaches the next edge to its left.
+    Upon finding the edge, the pivot and vector are updated.
+    The function will return the face the starting vector points into, even if 
+    an end point outside of the face is chosen. This logic can then be used to check
+    if an edge is part of the external face or not.
+    """
+
+    # Initialize values
+    face_edges, v, p = set(), v_start, p_start
+    while True:
+        min_cos, p_next, neighbors = -3, None, list(S.neighbors(p))
+
+        # Handle isolated edges (only one connection)
+        if len(neighbors) == 1:
+            p_next = neighbors[0]
+            face_edges.add((p, p_next))
+            v = vector(frame, (p_next, p))
+            p, p_next = p_next, None
+            continue
+
+        for r in neighbors:
+            # Skip cosine computation if r = previous point
+            if vector(frame, (p, r)) == v: continue
+
+            # Find point r with maximum cosine w.r.t. vector pr
+            cos_left = left_cos(v, vector(frame, (p, r)))
+            if cos_left >= min_cos: #TODO: handle cases where min_cos doesn't change, bzw check if ">=" suffices
+                min_cos, p_next = cos_left, r
+
+        # Find next edge, break if already contained in face_edges
+        edge = (p, p_next)
+        if edge in face_edges:
+            break
+
+        # Add edge to face_edges, stop if end conditions are met
+        face_edges.add(edge)
+        if p_start != p_end and p_next == p_end:
+            break
+        
+        # Define new vector and pivot for counter-clockwise rotation
+        v, p = vector(frame, (p_next, p)), p_next
+
+    return face_edges
+
+def collinear(frame, threshold = 0.9999): # arbitrary threshold of e-4
+    """Checks if the input frame is collinear, i.e. Delaunay triangulation cannot be performed. 
+    Includes cases where the frame has less than 3 nodes.
+    """
+    # Base case: if only 2 points are present, it is collinear by definition; include 0 or 1 node as well
+    if len(frame) <= 2: return True
+
+    # Check collinearity by checking if all angles between edges are 0 or 180 degrees
+    keys = list(frame.keys())
+    v1 = vector(frame,(keys[0], keys[1]))
+    for p in keys[2::]:
+        vp = vector(frame,(keys[0], p))
+        if abs(cos_vec(v1,vp)) <= threshold: return False
+
+    return True
+
+"""Shape graph"""
+
+def frame_to_shape_graph(frame):
+    """Construct the shape graph corresponding to a tracking frame.
+    
+    Parameters
+    ----------
+    frame : dict
+        Tracking frame with labels as keys and 2-dimensional tuples of xy 
+        coordinates  as values.
+
+    Returns
+    -------
+    networkx.Graph
+        Shape graph corresponding to the input `frame`.
+
+    Notes
+    -----
+    If the input `frame` contains multiple points that share identical  
+    coordinates, the algorithm transforms them first by iteratively adding a
+    small offset to them to avoid overlap and ensure correct Delaunay triangulation.
+    """
+
+    def prio_lr(e):
+        """Returns the left and right priority of an edge e as a tuple
+        (alpha(p,q), alpha(q,p)). Assumes Delaunay triangulation.
+
+        Note: The maximum angle point left or right of the respective edge
+        will always be the triangular node of the edge in Delaunay
+        triangulations
+        """
+        # Find all nodes that form a triangle with the edge points
+        tri_nodes = set(S.neighbors(e[0])) & set(S.neighbors(e[1]))
+        prio_l, prio_r = 1, 1
+        for r in tri_nodes:
+            rp, rq = vector(frame,(r,e[0])), vector(frame,(r,e[1]))
+            if (rp[0]*rq[1]-rp[1]*rq[0]) < 0:
+                if cos_vec(rp,rq) < prio_r:
+                    prio_r = cos_vec(rp,rq)
+            else:
+                if cos_vec(rp,rq) < prio_l:
+                    prio_l = cos_vec(rp,rq)
+        return prio_l, prio_r
+    
+    def update_external_face(frame, S, e, ext):
+        """Updates the external face if an external edge was removed"""
+
+        new_edges = set()
+        # Iterate through edges between p and q, store them in separate set and remove edge pq from the face if e (or its inverse) is present in the external face set
+        if (e[1],e[0]) in ext:
+            new_edges = iter_edges(frame, e[1], e[0], vector(frame, (e[1],e[0])),S)
+            ext.remove((e[1],e[0]))
+
+        elif e in ext:
+            new_edges = iter_edges(frame, e[0], e[1], vector(frame, e), S)
+            ext.remove(e)
+
+        # Add the new external edges to the external face set
+        for new_edge in new_edges:
+            ext.add(new_edge)
+
+        return ext
+
+    def is_external_face(face, ext):
+        """Determines if the new face is equivalent to the external edges
+
+        Note: For an edge e in the new face set, it is only necessary to 
+        check if it is contained in the external face set.
+        The properties of clockwise iteration for internal faces and 
+        counter-clockwise iterations for external faces are used here.
+        """
+        if next(iter(face)) in ext:
+            return True
+        else:
+            return False
+
+    def right_points(e, frame):
+        """Returns a set of all points right of edge vector pq"""
+        # Initiate vector and variables
+        pq = vector(frame,e)
+        right = set()
+
+        # Iterate through all points r and check if they are to the right of edge vector using the cross product pq x pr
+        for r in frame:
+            if r not in e:
+                pr = vector(frame,(e[0],r))
+                if (pr[1] * pq[0] - pr[0] * pq[1]) < 0:
+                    right.add(r)
+
+        return right
+
+    def cos_max(e, points):
+        """Determines the maximum cosine (i.e. minimum angle) of the internal angle prq between an edge p,q and point r to the right of it"""
+        # Find points to the right of edge and initialize alpha as 180 degrees (i.e. cos(alpha) = -1)
+        P_pq = right_points(e, points)
+        alpha = -1
+
+        # Find point r with maximum cosine value w.r.t. edge p,q
+        for r in P_pq:
+            if r in e:
+                continue
+
+            rp, rq = vector(frame, (r,e[0])), vector(frame, (r,e[1]))
+            prq = cos_vec(rp,rq)
+            if prq > alpha:
+                alpha = prq
+
+        return alpha
+
+    def alpha_pq(frame, e):
+        """Determines the minimum cosine cos(alpha(p,q)) of maximum angle prq 
+        of an edge p,q and point to the right r; return 1 (eq. to alpha = 0) 
+        if no point lies to the right.
+        """
+        if e in alpha_cache_dict:
+            return alpha_cache_dict[e]
+        
+        P_pq = right_points(e, frame)
+        alpha = 1
+        for r in P_pq:
+            rp, rq = vector(frame,(r,e[0])), vector(frame,(r,e[1]))
+            prq = cos_vec(rp,rq)
+            if prq < alpha:
+                alpha = prq
+
+        return alpha
+
+
+    # Initiate empty NetworkX graph with labels as nodes
+    S = nx.Graph()
+
+    # Create graph manually if Delaunay triangulation not possible (i.e., frame is collinear or contains less than 3 nodes)
+    if collinear(frame):
+        # add single node separately if only one node exists
+        if len(frame) <= 1:
+            if frame: S.add_node(points_list[0])
+
+        # concatenate nodes otherwise:
+        else:
+            # create a list of tuples from the frame to sort it later
+            points_list = [(key, frame[key][0], frame[key][1]) for key in frame]
+
+            # check the bigger difference between x and y coords of the points and sort it thereafter
+            if abs(points_list[0][1] - points_list[1][1]) < abs(points_list[0][2] - points_list[1][2]): 
+                k_key1, k_key2 = 0, 1
+            else: 
+                k_key1, k_key2 = 1, 0
+            sorted(points_list , key=lambda k: [k[k_key1], k[k_key2]])
+
+            # add edges in sorted manner
+            for i in range(len(points_list)-1):
+                p1, p2 = points_list[i][0], points_list[i+1][0]
+                S.add_edge(p1,p2)
+        
+        return S
+
+    # Initiate queue dict Q and priority maximum heap prio_heap, dicts that contain all edge vectors, all cosines of differing vectors and 
+    # alpha(p,q) of a given edge e = p,q (including inverse edges q,p)
+    Q = {}
+    prio_heap = []
+    alpha_cache_dict = {}
+
+    # Transform frame if it contains multiple nodes that share exact coords
+    frame = tweak_duplicates(frame)
+
+    # Get list of coordinates, labels, and indices of the data in the frame
+    coords = list(frame.values())
+    labels = list(frame.keys())
+    indices = {i: labels[i] for i in range(len(labels))}
+
+    # Perform Delaunay triangulation on the coordinates
+    tri=Delaunay(coords)
+
+    # Add Delaunay edges to nx-graph
+    for simplex in tri.simplices:
+        for i in range(3):
+            for j in range(i+1, 3):
+                S.add_edge(indices[simplex[i]], indices[simplex[j]])
+
+    # Define the priority threshold (in paper: = pi*3/4)
+    threshold = pi*3/4
+
+    # Initiate edges of external face before the queue loop
+    pivot = min(frame, key=lambda p: (frame[p][1], frame[p][0]))
+    E = iter_edges(frame, pivot, pivot, (0, -1), S)
+
+    # Update queue dict and priority heap
+    for e in S.edges:
+        alpha_cache_dict[(e[1],e[0])], alpha_cache_dict[e] = prio_lr(e)
+        prio = acos(alpha_cache_dict[(e[1],e[0])]) + acos(alpha_cache_dict[e])
+        if prio > threshold:
+            Q[e] = prio
+
+            # Since default heapq-heap is min-heap, make max values negative
+            heapq.heappush(prio_heap, (-prio, e))
+    
+    # Iterate through queue
+    while Q:
+
+        # Find edge along with maximum priority and remove it from heap
+        max_Q, e = heapq.heappop(prio_heap)
+        max_Q = -max_Q
+
+        # Start process if edge and priority are correctly extracted
+        if e in Q and Q[e] == max_Q:
+            
+            # Find edge points p and q, remove edge from nx.graph S, delete queue entry
+            p,q = e[0],e[1]
+            S.remove_edge(p,q)
+            del Q[e]
+
+            # Find new face after removing edge e and check if it is the external face
+            F = iter_edges(frame, p, p, vector(frame,e), S)
+            E = update_external_face(frame, S, e, E)
+            external_face = is_external_face(F, E)
+
+            # Calculate new priorities of the new face edges
+            for e_f in F:
+                prio = 0
+                if not external_face:
+                    F_pts = {edge[0]:frame[edge[0]] for edge in F}
+                    prio_new = cos_max(e_f, F_pts)
+                    alpha_cache_dict[e_f] = prio_new
+                    prio += acos(prio_new)    
+
+                prio += acos(alpha_pq(frame, (e_f[1],e_f[0])))
+                e_f = (e_f[1], e_f[0]) if (e_f[1], e_f[0]) in Q else e_f
+
+                # Update queue and priority heap
+                Q[e_f] = prio
+                if prio <= threshold:
+                    del Q[e_f]
+                else:
+                    heapq.heappush(prio_heap, (-prio, e_f))
+
+    return S
+
+
+"""Inferring positions"""
+
+def frame_to_positions(frame):
+    """Creates position plot coordinates from shape graph.
+    
+    Parameters
+    ----------
+    frame : dict
+        Tracking frame with labels as keys and 2-dimensional tuples of xy 
+        coordinates  as values.
+
+    Returns
+    -------
+    pos_dict : dict
+        Dictionary of tuples containing the inferred coordinates of each 
+        player according to the position matrix.
+    """
+
+    def find_faces(S, frame):
+        """Returns list of all internal faces"""
+        # Return empty list if only 1 edge is present (iter_edges needs 2 or more edges)
+        if len(S.edges) <= 1:
+            return []
+
+        # Initiate face list and find external face
+        faces = []
+        top_point = max(frame.items(), key=lambda item: item[1][1])[0]
+        E = iter_edges(frame, top_point, top_point, (0,1), S)
+
+        # Find adjacent faces of all edges and add to list
+        for e in S.edges:
+
+            # compute faces for both edge directions
+            F1 = iter_edges(frame, e[0], e[0], vector(frame, e), S)
+            F2 = iter_edges(frame, e[1], e[1], vector(frame, (e[1], e[0])), S)
+
+            # Skip addition to list if face = external face or it has already been added
+            if F1 not in faces and F1 != E:
+                faces.append(F1)
+            if F2 not in faces and F2 != E:
+                faces.append(F2)
+
+        return faces
+
+    def find_barycenters(S, frame, o_vec):
+        """Returns list of barycenters of each internal face, including tilted bridging edges"""
+        # Find internal faces and initiate barycenter list
+        faces = find_faces(S, frame)
+        barycenters = []
+
+        # check if bridging edges exist by checking if there is any edge in S that does not belong to any F in faces
+        face_edges = set()
+        for F in faces:
+            for e in F:
+                face_edges.add(e)
+        
+        # For edges not belonging to any face, check if they are tilted, and add their midpoint to barycenters if so
+        for e in S.edges:
+            if e not in face_edges:
+                if abs(cos_vec(vector(frame,e), o_vec)) < cos(1/8*pi):
+                    barycenters.append(((frame[e[0]][0]+frame[e[1]][0])/2,
+                                        (frame[e[0]][1]+frame[e[1]][1])/2))
+
+        # compute the barycenters of all internal faces
+        for F in faces:
+            x_cm, y_cm = 0, 0
+            for e in F:
+                x_cm += frame[e[0]][0]
+                y_cm += frame[e[0]][1]
+
+            x_cm, y_cm = x_cm/len(F), y_cm/len(F)
+            barycenters.append((x_cm, y_cm))
+
+        return barycenters
+
+    def split_positions(frame, orientation, pos_dict, reps = 2):
+        """Determines the position plot coordinates of all players in the desired 
+        orientation.
+         
+        Note: the function edits pos_dict directly instead of returning a new 
+        dictionary.
+        """
+        # Check orientation
+        if orientation == 'v':
+            idx = 1
+            norm_vec = (1,0)
+        elif orientation == 'h':
+            idx = 0
+            norm_vec = (0,1)
+        else:
+            print('Invalid orientation')
+            return
+
+        for c in range(reps,0,-1):
+            # Find the current frame without split off points
+            frame_current = {pt : frame[pt] for pt in frame if pos_dict[pt][idx] == 0}
+            
+            # Create shape graph
+            S_current = frame_to_shape_graph(frame_current)
+
+            # Get barycenters, including sloped bridging edges
+            B = find_barycenters(S_current, frame_current, norm_vec)
+
+            # Split the points according to the algorithm. If no barycenters exist, no split is made and whole group is central.
+            if B:
+                # Initialize min/max values of barycenters by setting them as starting point
+                b_min, b_max = min(b[idx] for b in B), max(b[idx] for b in B)
+
+                # Compute necessary lists and parameters for edge case check
+                p_min, p_max = min(frame_current[p][idx] for p in frame_current), max(frame_current[p][idx] for p in frame_current)
+                third1, third2 = p_min + (p_max-p_min)/3, p_max - (p_max-p_min)/3
+                
+                # Edge case 1: singleton, empty center, and rest. Also applies if sloped bridging edges are present. (example: midfield line with singular holding midfielder)
+                if b_min == b_max and len(S_current.nodes) >= 4:
+                    # Split points above and below (left and right of) barycenter
+                    over = [p for p in S_current.nodes if frame_current[p][idx] > b_min]
+                    under = [p for p in S_current.nodes if frame_current[p][idx] < b_min]
+
+                    # If singleton exists, update accordingly and keep the rest central (i.e. don't update such that coordinate remains 0)
+                    if len(over) == 1:
+                        pos_dict[over[0]][idx] += c
+                    elif len(under) == 1: 
+                        pos_dict[under[0]][idx] -= c
+                    
+                    # If no singleton is present, split normally
+                    else:
+                        for p in frame_current:
+                            if frame_current[p][idx] < b_min:
+                                pos_dict[p][idx] -= c
+                            if frame_current[p][idx] > b_max:
+                                pos_dict[p][idx] += c
+
+                # Edge case 2: all barycenters and at least one vertex in middle third (example: diamond midfield)
+                elif b_min > third1 and b_max < third2:
+                    for p in frame_current:
+                        if frame_current[p][idx] < third1:
+                            pos_dict[p][idx] -= c
+                        if frame_current[p][idx] > third2: 
+                            pos_dict[p][idx] += c
+
+                # Base case: normal splits under/over min/max barycenters
+                else:
+                    for p in frame_current:
+                        if frame_current[p][idx] < b_min:
+                            pos_dict[p][idx] -= c
+                        if frame_current[p][idx] > b_max:
+                            pos_dict[p][idx] += c
+
+    # Handle duplicate coordinates
+    frame = tweak_duplicates(frame)
+
+    # Initialize position dictionary to save a player's position
+    pos_dict = {p : [0,0] for p in frame.keys()}
+
+    # Update the position dictionary and return it (replace list with tuple for stability)
+    split_positions(frame, 'h', pos_dict)
+    split_positions(frame, 'v', pos_dict)
+    return {p : tuple(pos_dict[p]) for p in pos_dict}
