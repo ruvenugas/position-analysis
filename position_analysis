@@ -477,15 +477,14 @@ def frame_to_positions(frame):
                 b_min, b_max = min(b[idx] for b in B), max(b[idx] for b in B)
 
                 # Compute necessary lists and parameters for edge case check
-                p_min, p_max = min(frame_current[p][idx] for p in frame_current), max(frame_current[p][idx] for p in frame_current)
-                third1, third2 = p_min + (p_max-p_min)/3, p_max - (p_max-p_min)/3
-                
-                # Edge case 1: singleton, empty center, and rest. Also applies if sloped bridging edges are present. (example: midfield line with singular holding midfielder)
-                if b_min == b_max and len(S_current.nodes) >= 4:
-                    # Split points above and below (left and right of) barycenter
-                    over = [p for p in S_current.nodes if frame_current[p][idx] > b_min]
-                    under = [p for p in S_current.nodes if frame_current[p][idx] < b_min]
+                p_min, p_max = min(frame_current[p][idx] for p in frame_current), max(frame_current[p][idx] for p in frame_current) # Find min/max points in remaining shape graph
+                third1, third2 = p_min + (p_max-p_min)/3, p_max - (p_max-p_min)/3 # Split remaining area into thirds
+                over = [p for p in S_current.nodes if frame_current[p][idx] > b_min] # Split points above/left of barycenter
+                under = [p for p in S_current.nodes if frame_current[p][idx] < b_min] # Split points below/right of barycenter
 
+                # Edge case 1: singleton, empty center between b_min and b_max, and rest. Also applies if sloped bridging edges are present. (example: midfield line with singular holding midfielder)
+                if len(S_current.nodes) >= 4 and len(over) + len(under) == len(S_current.nodes):
+                    
                     # If singleton exists, update accordingly and keep the rest central (i.e. don't update such that coordinate remains 0)
                     if len(over) == 1:
                         pos_dict[over[0]][idx] += c
