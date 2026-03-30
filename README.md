@@ -6,3 +6,5 @@ The shape graph is a novel proximity graph based on the Delaunay triangulation. 
 This implementation is based on Python. The function frame_to_shape_graph takes as input a dictionary of players as keys and 2D-coordinate tuples as values (in metres) and returns the shape graph as a networkX.graph made up of nodes and edges. The function frame_to_positions takes the same input as frame_to_shape_graph, and returns a dictionary of players as keys and 2D position matrix coordinate tuples. The implementation can be used to conduct soccer analysis using positional data, like tracking data or event data containing player positions.
 
 Find the paper following this link: https://rdcu.be/fapYR
+
+For any questions about the implementation, feel free to contact me via mail: ruven21ugas@gmail.com
